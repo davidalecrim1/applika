@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     GITHUB_TOKEN_ENCRYPTION_KEY: str = (
         'changeme-set-a-fernet-key-in-production'
     )
+    API_KEY_HASH_PEPPER: str = (
+        'changeme-set-a-strong-api-key-pepper-in-production'
+    )
     DISCORD_REPORTS_ORGANIZATION: str | None = None
 
     LOGIN_REDIRECT_URI: str = 'http://127.0.0.1:8000/api/docs'

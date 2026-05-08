@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "applika-cli"
 version = "0.1.0"
-description = "CLI for Applika"
+description = "MCP entrypoint for Applika"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",

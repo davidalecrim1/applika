@@ -119,6 +119,10 @@ class UserModel(BaseMixin, Base):
     cycles: Mapped[List['CycleModel']] = relationship(
         back_populates='user'
     )
+    api_keys: Mapped[List['ApiKeyModel']] = relationship(
+        back_populates='user',
+        cascade='all, delete-orphan',
+    )
 
     @property
     def tech_stack(self) -> list[str]:
@@ -257,6 +261,30 @@ class ApplicationStepModel(BaseMixin, Base):
             return self.step_def.name
         except Exception:
             return None
+
+
+class ApiKeyModel(BaseMixin, Base):
+    __tablename__ = 'api_keys'
+
+    user_id: Mapped[int] = mapped_column(
+        sa.ForeignKey('users.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(sa.String(200), nullable=False)
+    key_id: Mapped[str] = mapped_column(
+        sa.String(64),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    key_hash: Mapped[str] = mapped_column(sa.String(128), nullable=False)
+    last4: Mapped[str] = mapped_column(sa.String(4), nullable=False)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
+
+    user: Mapped['UserModel'] = relationship(back_populates='api_keys')
 
 
 class ApplicationLastStep(TypedDict):

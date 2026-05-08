@@ -20,6 +20,7 @@ import { LinkedinIcon } from "../brand-icons";
 import { Badge } from "../ui/badge";
 import { getCurrencySymbol } from "./edit-form-config";
 import { useDeleteAccount } from "@/hooks/use-user";
+import { ApiKeysSection } from "./api-keys-section";
 
 function formatLabel(v?: string) {
   return v?.replace(/_/g, " ") ?? "";
@@ -241,6 +242,8 @@ export function UserProfileView({
           </div>
         )}
       </div>
+
+      <ApiKeysSection />
 
       {/* Delete Account */}
       <DeleteAccountCard username={user.username} />

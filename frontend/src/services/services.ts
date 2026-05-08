@@ -8,6 +8,7 @@ import { StatisticsService } from "@/services/implementations/statistics-service
 import { SupportsService } from "@/services/implementations/supports-service";
 import { CompanyService } from "@/services/implementations/company-service";
 import { ReportsService } from "@/services/implementations/reports-service";
+import { ApiKeyService } from "@/services/implementations/api-key-service";
 
 class ServiceContainer {
   admin = new AdminService();
@@ -20,6 +21,7 @@ class ServiceContainer {
   reports = new ReportsService();
   feedbacks = new FeedbackService();
   cycles = new CycleService();
+  apiKeys = new ApiKeyService();
 }
 
 export const services = new ServiceContainer();

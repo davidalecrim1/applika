@@ -2,7 +2,7 @@ from typing import Annotated
 
 import redis.asyncio as aioredis
 from fastapi import Depends, Security
-from fastapi.security import APIKeyCookie
+from fastapi.security import APIKeyCookie, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.dto.user import UserDTO
@@ -11,12 +11,16 @@ from app.application.services.github_service import GitHubService
 from app.application.use_cases.auth_handoff_state import (
     AuthHandoffStateUseCase,
 )
+from app.application.use_cases.api_keys.authenticate_api_key import (
+    AuthenticateApiKeyUseCase,
+)
 from app.application.use_cases.get_current_user import GetCurrentUserUseCase
 from app.config.db import get_session
 from app.config.redis import get_redis
 from app.config.settings import ACCESS_COOKIE_NAME, envs
 from app.core.exceptions import ForbiddenAccess
 from app.domain.repositories.admin_repository import AdminRepository
+from app.domain.repositories.api_key_repository import ApiKeyRepository
 from app.domain.repositories.application_repository import (
     ApplicationRepository,
 )
@@ -82,6 +86,10 @@ def get_user_statistics_repository(session: DbSession):
     return UserStatsRepository(session)
 
 
+def get_api_key_repository(session: DbSession):
+    return ApiKeyRepository(session)
+
+
 UserRepositoryDp = Annotated[UserRepository, Depends(get_user_repository)]
 
 FeedbackDefinitionRepositoryDp = Annotated[
@@ -114,6 +122,10 @@ ApplicationRepositoryDp = Annotated[
 
 UserStatsRepositoryDp = Annotated[
     UserStatsRepository, Depends(get_user_statistics_repository)
+]
+
+ApiKeyRepositoryDp = Annotated[
+    ApiKeyRepository, Depends(get_api_key_repository)
 ]
 
 
@@ -196,6 +208,21 @@ async def get_current_user(
 
 
 CurrentUserDp = Annotated[UserDTO, Depends(get_current_user)]
+
+
+async def get_current_api_key_user(
+    api_key_repo: ApiKeyRepositoryDp,
+    user_repo: UserRepositoryDp,
+    credentials: HTTPAuthorizationCredentials | None = Security(
+        HTTPBearer(auto_error=False)
+    ),
+) -> UserDTO:
+    use_case = AuthenticateApiKeyUseCase(api_key_repo, user_repo)
+    api_key = credentials.credentials if credentials else None
+    return await use_case.execute(api_key)
+
+
+CurrentApiKeyUserDp = Annotated[UserDTO, Depends(get_current_api_key_user)]
 
 
 async def get_admin_user(

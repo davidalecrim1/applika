@@ -1,22 +1,11 @@
-import argparse
 import json
-import secrets
+import os
 import sys
-import webbrowser
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-import httpx
-
-from api import (
-    ApiClient,
-    ApiError,
-    AuthError,
-    create_session_from_exchange,
-)
-from loopback import LoopbackLoginServer
-from session import SessionData, SessionStore, resolve_api_base_url
+from api import ApiClient, ApiError
 
 MODE_CHOICES = ('active', 'passive', 'all')
 STATUS_CHOICES = ('active', 'finalized', 'all')
@@ -31,268 +20,281 @@ EXPERIENCE_CHOICES = (
     'principal',
     'specialist',
 )
-CURRENCY_CHOICES = ('USD', 'BRL', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'INR')
+CURRENCY_CHOICES = (
+    'USD',
+    'BRL',
+    'EUR',
+    'GBP',
+    'CAD',
+    'AUD',
+    'JPY',
+    'CHF',
+    'INR',
+)
 SALARY_PERIOD_CHOICES = ('hourly', 'monthly', 'annual')
+JSONRPC_VERSION = '2.0'
+MCP_PROTOCOL_VERSION = '2024-11-05'
 
 
 @dataclass
-class CommandContext:
-    api_base_url: str
-    store: SessionStore
+class McpServer:
+    client: ApiClient
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                'name': 'applications_list',
+                'description': 'List applications for the authenticated user.',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'cycle_id': {'type': 'string'},
+                        'search': {'type': 'string'},
+                        'mode': {'type': 'string', 'enum': list(MODE_CHOICES)},
+                        'status': {
+                            'type': 'string',
+                            'enum': list(STATUS_CHOICES),
+                        },
+                        'platform': {'type': 'string'},
+                        'from_date': {'type': 'string'},
+                        'to_date': {'type': 'string'},
+                    },
+                },
+            },
+            {
+                'name': 'applications_create',
+                'description': 'Create a new application.',
+                'inputSchema': {
+                    'type': 'object',
+                    'required': [
+                        'company',
+                        'role',
+                        'platform',
+                        'mode',
+                        'application_date',
+                    ],
+                    'properties': application_input_properties(),
+                },
+            },
+            {
+                'name': 'applications_edit',
+                'description': 'Edit an existing current-cycle application.',
+                'inputSchema': {
+                    'type': 'object',
+                    'required': ['application_id'],
+                    'properties': {
+                        'application_id': {'type': 'string'},
+                        **application_input_properties(),
+                        'clear_job_url': {'type': 'boolean'},
+                        'clear_observation': {'type': 'boolean'},
+                        'clear_country': {'type': 'boolean'},
+                        'clear_salary': {'type': 'boolean'},
+                    },
+                },
+            },
+        ]
+
+    def handle_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
+        method = request.get('method')
+        request_id = request.get('id')
+
+        if method == 'initialize':
+            return {
+                'jsonrpc': JSONRPC_VERSION,
+                'id': request_id,
+                'result': {
+                    'protocolVersion': MCP_PROTOCOL_VERSION,
+                    'capabilities': {'tools': {}},
+                    'serverInfo': {
+                        'name': 'applika-mcp',
+                        'version': '0.1.0',
+                    },
+                },
+            }
+
+        if method == 'notifications/initialized':
+            return None
+
+        if method == 'tools/list':
+            return {
+                'jsonrpc': JSONRPC_VERSION,
+                'id': request_id,
+                'result': {'tools': self.list_tools()},
+            }
+
+        if method == 'tools/call':
+            try:
+                params = request.get('params') or {}
+                tool_name = params['name']
+                arguments = params.get('arguments') or {}
+                result = self.call_tool(tool_name, arguments)
+                return {
+                    'jsonrpc': JSONRPC_VERSION,
+                    'id': request_id,
+                    'result': {
+                        'content': [
+                            {
+                                'type': 'text',
+                                'text': json.dumps(result, indent=2, sort_keys=True),
+                            }
+                        ]
+                    },
+                }
+            except Exception as error:
+                return {
+                    'jsonrpc': JSONRPC_VERSION,
+                    'id': request_id,
+                    'error': {
+                        'code': -32000,
+                        'message': str(error),
+                    },
+                }
+
+        return {
+            'jsonrpc': JSONRPC_VERSION,
+            'id': request_id,
+            'error': {
+                'code': -32601,
+                'message': f'Method not found: {method}',
+            },
+        }
+
+    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        if tool_name == 'applications_list':
+            params = {}
+            if arguments.get('cycle_id'):
+                params['cycle_id'] = arguments['cycle_id']
+            applications = self.client.get_json('/mcp/applications', params=params or None)
+            supports = self.client.get_json('/mcp/supports')
+            return filter_applications(applications, supports, arguments)
+
+        if tool_name == 'applications_create':
+            payload = build_application_payload(
+                self.client,
+                arguments,
+                existing=None,
+            )
+            return self.client.post_json('/mcp/applications', payload)
+
+        if tool_name == 'applications_edit':
+            application_id = str(arguments.get('application_id', '')).strip()
+            if not application_id:
+                raise ValueError('application_id is required')
+            applications = self.client.get_json('/mcp/applications')
+            existing = next(
+                (
+                    application
+                    for application in applications
+                    if str(application['id']) == application_id
+                ),
+                None,
+            )
+            if existing is None:
+                raise ValueError('Application not found in the current cycle')
+            if existing.get('finalized'):
+                raise ValueError('Finalized applications cannot be edited')
+            payload = build_application_payload(
+                self.client,
+                arguments,
+                existing=existing,
+            )
+            return self.client.put_json(
+                f'/mcp/applications/{application_id}',
+                payload,
+            )
+
+        raise ValueError(f'Unknown tool: {tool_name}')
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='applika')
-    parser.add_argument('--api-base-url')
-    subparsers = parser.add_subparsers(dest='command', required=True)
-
-    login_parser = subparsers.add_parser('login')
-    login_parser.set_defaults(handler=handle_login)
-
-    logout_parser = subparsers.add_parser('logout')
-    logout_parser.set_defaults(handler=handle_logout)
-
-    applications_parser = subparsers.add_parser('applications')
-    applications_subparsers = applications_parser.add_subparsers(
-        dest='applications_command',
-        required=True,
-    )
-
-    list_parser = applications_subparsers.add_parser('list')
-    list_parser.add_argument('--cycle-id')
-    list_parser.add_argument('--search')
-    list_parser.add_argument('--mode', choices=MODE_CHOICES, default='all')
-    list_parser.add_argument(
-        '--status',
-        choices=STATUS_CHOICES,
-        default='all',
-    )
-    list_parser.add_argument('--platform')
-    list_parser.add_argument('--from', dest='from_date')
-    list_parser.add_argument('--to', dest='to_date')
-    list_parser.add_argument('--json', action='store_true')
-    list_parser.set_defaults(handler=handle_applications_list)
-
-    new_parser = applications_subparsers.add_parser('new')
-    add_application_args(new_parser, require_all=True)
-    new_parser.set_defaults(handler=handle_applications_new)
-
-    edit_parser = applications_subparsers.add_parser('edit')
-    edit_parser.add_argument('application_id')
-    add_application_args(edit_parser, require_all=False)
-    edit_parser.add_argument('--clear-job-url', action='store_true')
-    edit_parser.add_argument('--clear-observation', action='store_true')
-    edit_parser.add_argument('--clear-country', action='store_true')
-    edit_parser.add_argument('--clear-salary', action='store_true')
-    edit_parser.set_defaults(handler=handle_applications_edit)
-
-    return parser
+def application_input_properties() -> dict[str, Any]:
+    return {
+        'company': {'type': 'string'},
+        'company_url': {'type': 'string'},
+        'role': {'type': 'string'},
+        'platform': {'type': 'string'},
+        'mode': {'type': 'string', 'enum': list(MODE_CHOICES[:2])},
+        'application_date': {'type': 'string'},
+        'job_url': {'type': 'string'},
+        'observation': {'type': 'string'},
+        'expected_salary': {'type': 'number'},
+        'salary_min': {'type': 'number'},
+        'salary_max': {'type': 'number'},
+        'currency': {'type': 'string', 'enum': list(CURRENCY_CHOICES)},
+        'salary_period': {
+            'type': 'string',
+            'enum': list(SALARY_PERIOD_CHOICES),
+        },
+        'experience_level': {
+            'type': 'string',
+            'enum': list(EXPERIENCE_CHOICES),
+        },
+        'work_mode': {'type': 'string', 'enum': list(WORK_MODE_CHOICES)},
+        'country': {'type': 'string'},
+    }
 
 
-def add_application_args(
-    parser: argparse.ArgumentParser,
-    *,
-    require_all: bool,
-) -> None:
-    parser.add_argument('--company', required=require_all)
-    parser.add_argument('--company-url')
-    parser.add_argument('--role', required=require_all)
-    parser.add_argument('--platform', required=require_all)
-    parser.add_argument(
-        '--mode',
-        choices=MODE_CHOICES[:2],
-        required=require_all,
-    )
-    parser.add_argument('--date', dest='application_date', required=require_all)
-    parser.add_argument('--job-url')
-    parser.add_argument('--observation')
-    parser.add_argument('--expected-salary', type=float)
-    parser.add_argument('--salary-min', type=float)
-    parser.add_argument('--salary-max', type=float)
-    parser.add_argument('--currency', choices=CURRENCY_CHOICES)
-    parser.add_argument('--salary-period', choices=SALARY_PERIOD_CHOICES)
-    parser.add_argument('--experience-level', choices=EXPERIENCE_CHOICES)
-    parser.add_argument('--work-mode', choices=WORK_MODE_CHOICES)
-    parser.add_argument('--country')
+def read_message() -> dict[str, Any] | None:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b'\r\n', b'\n'):
+            break
+        name, value = line.decode().split(':', 1)
+        headers[name.strip().lower()] = value.strip()
+    content_length = int(headers['content-length'])
+    body = sys.stdin.buffer.read(content_length)
+    return json.loads(body.decode())
 
 
-def normalize_argv(argv: list[str]) -> list[str]:
-    if not argv:
-        return argv
-    if argv[0] == 'applications':
-        if len(argv) == 1:
-            return ['applications', 'list']
-        if argv[1] == '-n':
-            return ['applications', 'new', *argv[2:]]
-        if argv[1] not in {'list', 'new', 'edit'}:
-            return ['applications', 'list', *argv[1:]]
-    return argv
+def write_message(payload: dict[str, Any]) -> None:
+    body = json.dumps(payload).encode()
+    sys.stdout.buffer.write(f'Content-Length: {len(body)}\r\n\r\n'.encode())
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = normalize_argv(list(argv or sys.argv[1:]))
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    store = SessionStore()
-    context = CommandContext(
-        api_base_url=resolve_api_base_url(args.api_base_url, store),
-        store=store,
-    )
-    try:
-        return args.handler(args, context)
-    except (
-        ApiError,
-        AuthError,
-        RuntimeError,
-        ValueError,
-        httpx.HTTPError,
-    ) as error:
-        print(str(error), file=sys.stderr)
+def main() -> int:
+    api_key = os.getenv('APPLIKA_API_KEY')
+    if not api_key:
+        print('APPLIKA_API_KEY is required', file=sys.stderr)
         return 1
 
+    api_base_url = os.getenv('APPLIKA_API_BASE_URL', 'http://127.0.0.1:8000/api')
+    client = ApiClient(api_base_url=api_base_url, api_key=api_key)
+    server = McpServer(client)
 
-def handle_login(args: argparse.Namespace, context: CommandContext) -> int:
-    state = secrets.token_urlsafe(24)
-    server = LoopbackLoginServer(expected_state=state)
-    server.start()
     try:
-        response = httpx.post(
-            f'{context.api_base_url}/auth/cli/start',
-            json={
-                'callback_url': server.callback_url,
-                'state': state,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        login_url = data['login_url']
-        browser_opened = webbrowser.open(login_url)
-        if not browser_opened:
-            print(f'Open this URL to continue login:\n{login_url}')
-        code = server.wait_for_code(timeout_seconds=300)
-        exchange = httpx.post(
-            f'{context.api_base_url}/auth/cli/exchange',
-            json={'code': code},
-            timeout=30,
-        )
-        exchange.raise_for_status()
-        session = create_session_from_exchange(
-            context.api_base_url,
-            exchange.json(),
-        )
-        context.store.save(session)
-        print('Login successful.')
-        return 0
-    finally:
-        server.close()
-
-
-def handle_logout(args: argparse.Namespace, context: CommandContext) -> int:
-    session = require_session(context.store)
-    client = ApiClient(session, context.store)
-    try:
-        client.logout()
+        while True:
+            message = read_message()
+            if message is None:
+                return 0
+            response = server.handle_request(message)
+            if response is not None:
+                write_message(response)
+    except (ApiError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
     finally:
         client.close()
-    print('Logged out.')
-    return 0
-
-
-def handle_applications_list(
-    args: argparse.Namespace,
-    context: CommandContext,
-) -> int:
-    session = require_session(context.store)
-    client = ApiClient(session, context.store)
-    try:
-        params = {'cycle_id': args.cycle_id} if args.cycle_id else None
-        applications = client.get_json('/applications', params=params)
-        supports = client.get_json('/supports')
-        filtered = filter_applications(applications, supports, args)
-        if args.json:
-            print(json.dumps(filtered, indent=2, sort_keys=True))
-        else:
-            render_application_table(filtered, supports)
-        return 0
-    finally:
-        client.close()
-
-
-def handle_applications_new(
-    args: argparse.Namespace,
-    context: CommandContext,
-) -> int:
-    session = require_session(context.store)
-    client = ApiClient(session, context.store)
-    try:
-        payload = build_application_payload(
-            client,
-            args,
-            existing=None,
-        )
-        created = client.post_json('/applications', payload)
-        print_application_summary(created, 'Created application')
-        return 0
-    finally:
-        client.close()
-
-
-def handle_applications_edit(
-    args: argparse.Namespace,
-    context: CommandContext,
-) -> int:
-    session = require_session(context.store)
-    client = ApiClient(session, context.store)
-    try:
-        applications = client.get_json('/applications')
-        existing = next(
-            (
-                application
-                for application in applications
-                if str(application['id']) == args.application_id
-            ),
-            None,
-        )
-        if existing is None:
-            raise ValueError('Application not found in the current cycle')
-        if existing.get('finalized'):
-            raise ValueError('Finalized applications cannot be edited')
-        payload = build_application_payload(
-            client,
-            args,
-            existing=existing,
-        )
-        updated = client.put_json(
-            f"/applications/{args.application_id}",
-            payload,
-        )
-        print_application_summary(updated, 'Updated application')
-        return 0
-    finally:
-        client.close()
-
-
-def require_session(store: SessionStore) -> SessionData:
-    session = store.try_load()
-    if not session:
-        raise AuthError('Please run `applika login` first.')
-    return session
 
 
 def filter_applications(
     applications: list[dict[str, Any]],
     supports: dict[str, Any],
-    args: argparse.Namespace,
+    args: dict[str, Any],
 ) -> list[dict[str, Any]]:
     platform_id = None
-    if args.platform:
-        platform_id = resolve_platform_id(supports, args.platform)
+    if args.get('platform'):
+        platform_id = resolve_platform_id(supports, args['platform'])
 
     filtered = []
-    search = (args.search or '').strip().lower()
-    from_date = parse_date(args.from_date) if args.from_date else None
-    to_date = parse_date(args.to_date) if args.to_date else None
+    search = (args.get('search') or '').strip().lower()
+    from_date = parse_date(args['from_date']) if args.get('from_date') else None
+    to_date = parse_date(args['to_date']) if args.get('to_date') else None
+    mode = args.get('mode', 'all')
+    status = args.get('status', 'all')
 
     for application in applications:
         if search:
@@ -300,11 +302,11 @@ def filter_applications(
             role = (application.get('role') or '').lower()
             if search not in company_name and search not in role:
                 continue
-        if args.mode != 'all' and application.get('mode') != args.mode:
+        if mode != 'all' and application.get('mode') != mode:
             continue
-        if args.status == 'active' and application.get('finalized'):
+        if status == 'active' and application.get('finalized'):
             continue
-        if args.status == 'finalized' and not application.get('finalized'):
+        if status == 'finalized' and not application.get('finalized'):
             continue
         if platform_id and str(application.get('platform_id')) != platform_id:
             continue
@@ -321,43 +323,43 @@ def filter_applications(
 
 def build_application_payload(
     client: ApiClient,
-    args: argparse.Namespace,
+    args: dict[str, Any],
     *,
     existing: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    supports = client.get_json('/supports')
+    supports = client.get_json('/mcp/supports')
     company = resolve_company_input(
         client,
-        company_name=args.company,
-        company_url=args.company_url,
+        company_name=args.get('company'),
+        company_url=args.get('company_url'),
         existing=existing,
     )
     platform_id = (
-        resolve_platform_id(supports, args.platform)
-        if args.platform
+        resolve_platform_id(supports, args['platform'])
+        if args.get('platform')
         else str(existing['platform_id'])
     )
     application_date = (
-        ensure_date_string(args.application_date)
-        if args.application_date
+        ensure_date_string(args['application_date'])
+        if args.get('application_date')
         else existing['application_date']
     )
-    role = args.role if args.role is not None else existing['role']
-    mode = args.mode if args.mode is not None else existing['mode']
+    role = args['role'] if args.get('role') is not None else existing['role']
+    mode = args['mode'] if args.get('mode') is not None else existing['mode']
     link_to_job = choose_optional_value(
-        provided=args.job_url,
+        provided=args.get('job_url'),
         existing=existing.get('link_to_job') if existing else None,
-        clear=getattr(args, 'clear_job_url', False),
+        clear=bool(args.get('clear_job_url')),
     )
     observation = choose_optional_value(
-        provided=args.observation,
+        provided=args.get('observation'),
         existing=existing.get('observation') if existing else None,
-        clear=getattr(args, 'clear_observation', False),
+        clear=bool(args.get('clear_observation')),
     )
     country = choose_optional_value(
-        provided=args.country,
+        provided=args.get('country'),
         existing=existing.get('country') if existing else None,
-        clear=getattr(args, 'clear_country', False),
+        clear=bool(args.get('clear_country')),
     )
     salary = build_salary_fields(args, existing)
 
@@ -376,23 +378,23 @@ def build_application_payload(
         'salary_range_min': salary['salary_range_min'],
         'salary_range_max': salary['salary_range_max'],
         'experience_level': (
-            args.experience_level
-            if args.experience_level is not None
+            args['experience_level']
+            if args.get('experience_level') is not None
             else (existing.get('experience_level') if existing else None)
         ),
         'work_mode': (
-            args.work_mode
-            if args.work_mode is not None
+            args['work_mode']
+            if args.get('work_mode') is not None
             else (existing.get('work_mode') if existing else None)
         ),
     }
 
 
 def build_salary_fields(
-    args: argparse.Namespace,
+    args: dict[str, Any],
     existing: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if getattr(args, 'clear_salary', False):
+    if args.get('clear_salary'):
         return {
             'currency': None,
             'salary_period': None,
@@ -402,28 +404,28 @@ def build_salary_fields(
         }
 
     expected_salary = (
-        args.expected_salary
-        if args.expected_salary is not None
+        args['expected_salary']
+        if args.get('expected_salary') is not None
         else (existing.get('expected_salary') if existing else None)
     )
     salary_range_min = (
-        args.salary_min
-        if args.salary_min is not None
+        args['salary_min']
+        if args.get('salary_min') is not None
         else (existing.get('salary_range_min') if existing else None)
     )
     salary_range_max = (
-        args.salary_max
-        if args.salary_max is not None
+        args['salary_max']
+        if args.get('salary_max') is not None
         else (existing.get('salary_range_max') if existing else None)
     )
     currency = (
-        args.currency
-        if args.currency is not None
+        args['currency']
+        if args.get('currency') is not None
         else (existing.get('currency') if existing else None)
     )
     salary_period = (
-        args.salary_period
-        if args.salary_period is not None
+        args['salary_period']
+        if args.get('salary_period') is not None
         else (existing.get('salary_period') if existing else None)
     )
     has_salary = any(
@@ -465,7 +467,7 @@ def resolve_company_input(
         }
 
     query = company_name.strip().lower()
-    matches = client.get_json('/companies', params={'name': query})
+    matches = client.get_json('/mcp/companies', params={'name': query})
     exact_match = next(
         (
             company
@@ -520,58 +522,6 @@ def parse_date(value: str) -> date:
 def ensure_date_string(value: str) -> str:
     parse_date(value)
     return value
-
-
-def render_application_table(
-    applications: list[dict[str, Any]],
-    supports: dict[str, Any],
-) -> None:
-    platform_names = {
-        str(platform['id']): platform['name']
-        for platform in supports['platforms']
-    }
-    rows = [
-        [
-            str(app['id']),
-            app['application_date'],
-            app['company_name'],
-            app['role'],
-            app['mode'],
-            platform_names.get(str(app['platform_id']), str(app['platform_id'])),
-            'finalized' if app['finalized'] else 'active',
-        ]
-        for app in applications
-    ]
-    headers = ['id', 'date', 'company', 'role', 'mode', 'platform', 'status']
-    widths = [
-        max(len(header), *(len(row[index]) for row in rows))
-        if rows
-        else len(header)
-        for index, header in enumerate(headers)
-    ]
-    print(
-        '  '.join(
-            header.ljust(widths[index])
-            for index, header in enumerate(headers)
-        )
-    )
-    for row in rows:
-        print(
-            '  '.join(
-                value.ljust(widths[index])
-                for index, value in enumerate(row)
-            )
-        )
-
-
-def print_application_summary(application: dict[str, Any], prefix: str) -> None:
-    print(
-        f"{prefix}: "
-        f"id={application['id']} "
-        f"company={application['company_name']} "
-        f"role={application['role']} "
-        f"date={application['application_date']}"
-    )
 
 
 if __name__ == '__main__':
